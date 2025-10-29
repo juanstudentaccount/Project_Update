@@ -1,1 +1,1 @@
-claude ai updated charter link: https://juanstudentaccount.github.io/claude/
+Project Update link: https://juanstudentaccount.github.io/claude/
