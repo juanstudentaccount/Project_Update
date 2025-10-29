@@ -106,7 +106,7 @@
   <header>
     <div class="inner">
       <h1>Team Status Updates</h1>
-      <span class="pill">Unified, executive-ready summary of the class project portfolio.</span>
+      <span class="pill" id="connStatus">Local-only (no backend)</span>
     </div>
   </header>
 
@@ -191,7 +191,67 @@
     </section>
   </div>
 
-  <script>
+  <!-- Switch to a module script to use Supabase ESM -->
+  <script type="module">
+  /*
+    Shared persistence via Supabase (client-only). Steps:
+    1) Create a Supabase project and copy your URL and anon key below.
+    2) Create tables:
+
+       -- team updates
+       create table if not exists public.updates (
+         id text primary key,
+         date text,
+         owner text,
+         health text check (health in ('green','yellow','red')) default 'green',
+         summary text,
+         highlights jsonb default '[]'::jsonb,
+         risks jsonb default '[]'::jsonb,
+         next jsonb default '[]'::jsonb,
+         created_at timestamptz default now()
+       );
+
+       -- exec summary + counters (single row, id='default')
+       create table if not exists public.portfolio_meta (
+         id text primary key,
+         exec_summary text,
+         green integer default 0,
+         yellow integer default 0,
+         red integer default 0,
+         updated_at timestamptz default now()
+       );
+       insert into public.portfolio_meta (id) values ('default')
+       on conflict (id) do nothing;
+
+    3) Turn on Row Level Security. Add permissive policies for quick testing (tighten later):
+       -- updates
+       create policy "updates anon read" on public.updates for select using (true);
+       create policy "updates anon write" on public.updates for insert with check (true);
+       create policy "updates anon update" on public.updates for update using (true);
+       create policy "updates anon delete" on public.updates for delete using (true);
+
+       -- portfolio_meta
+       create policy "meta anon read" on public.portfolio_meta for select using (true);
+       create policy "meta anon write" on public.portfolio_meta for insert with check (true);
+       create policy "meta anon update" on public.portfolio_meta for update using (true);
+
+    4) Deploy this HTML on GitHub Pages. Everyone will read/write the shared tables.
+  */
+
+  import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+  // === CONFIGURE THESE TWO VALUES ===
+  const SUPABASE_URL = "https://YOUR_PROJECT.supabase.co";
+  const SUPABASE_ANON_KEY = "YOUR_ANON_KEY";
+  // ==================================
+
+  const supaReady = SUPABASE_URL.startsWith("https://") && !SUPABASE_URL.includes("YOUR_PROJECT") && !SUPABASE_ANON_KEY.includes("YOUR_ANON_KEY");
+  const supabase = supaReady ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
+
+  // Show connection status
+  const conn = document.getElementById("connStatus");
+  if (conn) conn.textContent = supaReady ? "Connected (shared via Supabase)" : "Local-only (no backend)";
+
   // Optional tiles data (defensive rendering)
   const PMO_LINKS = [
     "https://adiaz341.github.io/Project-Charter/",
@@ -202,7 +262,7 @@
   ];
   const PMO_NAMES = ["Alejandro Diaz","Ryan Hwang","Jeremy Yan","Juan Talome","Alexis Pinon"];
 
-  // Fresh keys so the page starts clean
+  // Keys for offline cache (used as fallback + perf cache)
   const UPDATES_KEY = "pmo_team_updates_v3";
   const SUM_KEY     = "pmo_exec_summary_v3";
   const G_KEY       = "pmo_exec_green_v2";
@@ -219,18 +279,47 @@
   const $ = (s,r=document)=>r.querySelector(s);
   const el=(tag,cls,txt)=>{ const n=document.createElement(tag); if(cls) n.className=cls; if(txt!==undefined) n.textContent=txt; return n; };
   const uid=()=> Date.now().toString(36)+Math.random().toString(36).slice(2,7);
+  const parseList=(s)=> (s||"").split(/[\n,;•]+/).map(v=>v.trim()).filter(Boolean);
 
-  // Parse list text (accepts commas, new lines, semicolons, bullets)
-  const parseList=(s)=> (s||"")
-    .split(/[\n,;•]+/)
-    .map(v=>v.trim())
-    .filter(Boolean);
+  // Local cache helpers
+  const loadUpdatesLocal = ()=>{ try{ return JSON.parse(localStorage.getItem(UPDATES_KEY) || "[]"); } catch { return []; } };
+  const saveUpdatesLocal = (arr)=>{ try{ localStorage.setItem(UPDATES_KEY, JSON.stringify(arr)); } catch {} };
 
-  // Load/Save
-  const loadUpdates = ()=>{ try{ return JSON.parse(localStorage.getItem(UPDATES_KEY) || "[]"); } catch { return []; } };
-  const saveUpdates = (arr)=>{ try{ localStorage.setItem(UPDATES_KEY, JSON.stringify(arr)); } catch {} };
+  // Remote (Supabase) helpers
+  async function remoteLoadUpdates() {
+    const { data, error } = await supabase
+      .from("updates")
+      .select("*")
+      .order("date", { ascending: false })
+      .order("created_at", { ascending: false });
+    if (error) throw error;
+    return (data || []).map(u => ({
+      id: u.id, date: u.date, owner: u.owner, health: u.health,
+      summary: u.summary, highlights: u.highlights || [], risks: u.risks || [], next: u.next || []
+    }));
+  }
+  async function remoteUpsertUpdate(u) {
+    const { error } = await supabase.from("updates").upsert(u, { onConflict: "id" });
+    if (error) throw error;
+  }
+  async function remoteDeleteUpdate(id) {
+    const { error } = await supabase.from("updates").delete().eq("id", id);
+    if (error) throw error;
+  }
+  async function remoteLoadMeta() {
+    const { data, error } = await supabase.from("portfolio_meta").select("*").eq("id","default").maybeSingle();
+    if (error) throw error;
+    return data || null;
+  }
+  async function remoteSaveMeta(meta) {
+    const payload = { id: "default", ...meta };
+    const { error } = await supabase.from("portfolio_meta").upsert(payload, { onConflict: "id" });
+    if (error) throw error;
+  }
 
-  let TEAM_UPDATES = loadUpdates(); // starts empty with new key
+  // State
+  let TEAM_UPDATES = loadUpdatesLocal(); // start with cache; will be replaced by remote if available
+  let EDIT_ID = null;
 
   // Tiles
   function renderTiles(){
@@ -280,7 +369,15 @@
       const editBtn=el('button','btn small','Edit'); editBtn.type='button';
       const delBtn=el('button','btn ghost small','Delete'); delBtn.type='button';
       editBtn.addEventListener('click',(e)=>{ e.preventDefault(); startEditById(u.id); });
-      delBtn.addEventListener('click',(e)=>{ e.preventDefault(); deleteById(u.id); });
+      delBtn.addEventListener('click', async (e)=>{
+        e.preventDefault();
+        if (supaReady) {
+          try { await remoteDeleteUpdate(u.id); } catch {}
+        } else {
+          deleteByIdLocal(u.id);
+        }
+        await refreshFromSource();
+      });
       actions.appendChild(editBtn); actions.appendChild(delBtn);
       body.appendChild(actions);
 
@@ -290,11 +387,9 @@
   }
 
   // Executive Summary + counters
-  function renderSummary(){
+  function renderSummaryFromLocal(){
     const sEl=$("#execSummary"), gEl=$("#ctGreen"), yEl=$("#ctYellow"), rEl=$("#ctRed"), tEl=$("#ctTotal");
     if(!sEl||!gEl||!yEl||!rEl||!tEl) return;
-
-    // Load (new keys start empty/0 if nothing saved)
     try{
       const sVal=localStorage.getItem(SUM_KEY);
       const gVal=localStorage.getItem(G_KEY);
@@ -305,49 +400,83 @@
       yEl.textContent = yVal ?? "0";
       rEl.textContent = rVal ?? "0";
     }catch{}
+    updateTotal();
+  }
+
+  function updateTotal(){
+    const gEl=$("#ctGreen"), yEl=$("#ctYellow"), rEl=$("#ctRed"), tEl=$("#ctTotal");
+    if(!gEl||!yEl||!rEl||!tEl) return;
+    const toInt = (el)=>{ const n=parseInt((el.textContent||'0').replace(/[^\d-]/g,''),10); return isFinite(n)?Math.max(0,n):0; };
+    tEl.textContent = String(toInt(gEl)+toInt(yEl)+toInt(rEl));
+  }
+
+  function attachSummaryHandlers(){
+    const sEl=$("#execSummary"), gEl=$("#ctGreen"), yEl=$("#ctYellow"), rEl=$("#ctRed");
+    if(!sEl||!gEl||!yEl||!rEl) return;
 
     const toInt = (el)=>{ const n=parseInt((el.textContent||'0').replace(/[^\d-]/g,''),10); return isFinite(n)?Math.max(0,n):0; };
-    const updateTotal=()=>{ tEl.textContent=String(toInt(gEl)+toInt(yEl)+toInt(rEl)); };
-    updateTotal();
 
-    const saveCounts=()=>{ try{
-      localStorage.setItem(G_KEY, String(toInt(gEl)));
-      localStorage.setItem(Y_KEY, String(toInt(yEl)));
-      localStorage.setItem(R_KEY, String(toInt(rEl)));
-    }catch{} updateTotal(); };
+    const persistCountsLocal = ()=>{
+      try{
+        localStorage.setItem(G_KEY, String(toInt(gEl)));
+        localStorage.setItem(Y_KEY, String(toInt(yEl)));
+        localStorage.setItem(R_KEY, String(toInt(rEl)));
+      }catch{}
+      updateTotal();
+    };
+    const persistCountsRemote = async ()=>{
+      if (!supaReady) return;
+      try{
+        await remoteSaveMeta({
+          green: toInt(gEl),
+          yellow: toInt(yEl),
+          red: toInt(rEl),
+        });
+      }catch{}
+      updateTotal();
+    };
+    const persistSummaryLocal = ()=>{ try{ localStorage.setItem(SUM_KEY, sEl.textContent||""); }catch{} };
+    const persistSummaryRemote = async ()=>{
+      if (!supaReady) return;
+      try{ await remoteSaveMeta({ exec_summary: sEl.textContent || "" }); }catch{}
+    };
+
     ["input","blur","keyup"].forEach(ev=>{
-      gEl.addEventListener(ev, saveCounts);
-      yEl.addEventListener(ev, saveCounts);
-      rEl.addEventListener(ev, saveCounts);
+      gEl.addEventListener(ev, ()=>{ persistCountsLocal(); persistCountsRemote(); });
+      yEl.addEventListener(ev, ()=>{ persistCountsLocal(); persistCountsRemote(); });
+      rEl.addEventListener(ev, ()=>{ persistCountsLocal(); persistCountsRemote(); });
     });
-
-    const saveSummary=()=>{ try{ localStorage.setItem(SUM_KEY, sEl.textContent||""); }catch{} };
-    ["input","blur"].forEach(ev=> sEl.addEventListener(ev, saveSummary));
+    ["input","blur"].forEach(ev=> sEl.addEventListener(ev, ()=>{ persistSummaryLocal(); persistSummaryRemote(); }));
 
     $("#clearSummaryBtn")?.addEventListener('click', ()=>{
-      sEl.textContent=""; try{ localStorage.removeItem(SUM_KEY); }catch{} sEl.focus();
+      sEl.textContent="";
+      try{ localStorage.removeItem(SUM_KEY); }catch{}
+      if (supaReady) remoteSaveMeta({ exec_summary: "" }).catch(()=>{});
+      sEl.focus();
+      updateTotal();
     });
   }
 
-  // Add/Edit/Delete with stable IDs
-  let EDIT_ID=null;
+  // Add/Edit/Delete (local)
   function startEditById(id){
     const u=TEAM_UPDATES.find(x=>x.id===id); if(!u) return;
     $("#updDate").value=u.date||'';
     $("#updHealth").value=u.health||'green';
     $("#updSummary").value=u.summary||'';
-    $("#updHighlights").value=(u.highlights||[]).join('\n');
-    $("#updRisks").value=(u.risks||[]).join('\n');
-    $("#updNext").value=(u.next||[]).join('\n');
+    $("#updHighlights").value=(u.highlights||[]).join('\\n');
+    $("#updRisks").value=(u.risks||[]).join('\\n');
+    $("#updNext").value=(u.next||[]).join('\\n');
     $("#addUpdateBtn").textContent='Save Update';
     EDIT_ID=id;
     $("#updateForm").scrollIntoView({behavior:'smooth', block:'start'});
   }
-  function deleteById(id){
+
+  function deleteByIdLocal(id){
     const i=TEAM_UPDATES.findIndex(x=>x.id===id); if(i<0) return;
-    TEAM_UPDATES.splice(i,1); saveUpdates(TEAM_UPDATES); renderUpdates();
+    TEAM_UPDATES.splice(i,1); saveUpdatesLocal(TEAM_UPDATES); renderUpdates();
   }
-  function addOrSaveUpdate(){
+
+  async function addOrSaveUpdate(){
     const d=$("#updDate").value || new Date().toISOString().slice(0,10);
     const h=$("#updHealth").value || 'green';
     const s=($("#updSummary").value||'').trim();
@@ -355,15 +484,26 @@
     const rk=parseList($("#updRisks").value);
     const nx=parseList($("#updNext").value);
 
-    if(EDIT_ID){
-      const i=TEAM_UPDATES.findIndex(x=>x.id===EDIT_ID);
-      if(i>=0) TEAM_UPDATES[i] = { ...TEAM_UPDATES[i], date:d, health:h, summary:s, highlights:hl, risks:rk, next:nx };
+    if (supaReady){
+      // Remote upsert
+      const id = EDIT_ID || uid();
+      const row = { id, date:d, owner:'PMO', health:h, summary:s, highlights:hl, risks:rk, next:nx };
+      try { await remoteUpsertUpdate(row); } catch (e) { console.error(e); }
       EDIT_ID=null; $("#addUpdateBtn").textContent='Add Update';
-    }else{
-      TEAM_UPDATES.push({ id: uid(), date:d, owner:'PMO', health:h, summary:s, highlights:hl, risks:rk, next:nx });
+      await refreshFromSource();
+    } else {
+      // Local-only
+      if(EDIT_ID){
+        const i=TEAM_UPDATES.findIndex(x=>x.id===EDIT_ID);
+        if(i>=0) TEAM_UPDATES[i] = { ...TEAM_UPDATES[i], date:d, health:h, summary:s, highlights:hl, risks:rk, next:nx };
+        EDIT_ID=null; $("#addUpdateBtn").textContent='Add Update';
+      }else{
+        TEAM_UPDATES.push({ id: uid(), date:d, owner:'PMO', health:h, summary:s, highlights:hl, risks:rk, next:nx });
+      }
+      saveUpdatesLocal(TEAM_UPDATES);
+      renderUpdates();
     }
-    saveUpdates(TEAM_UPDATES);
-    renderUpdates();
+
     ['updSummary','updHighlights','updRisks','updNext'].forEach(id=>{ const el=$("#"+id); if(el) el.value=''; });
   }
 
@@ -371,11 +511,67 @@
   const expandAllUpdates=()=> document.querySelectorAll('details.update').forEach(d=>d.open=true);
   const collapseAllUpdates=()=> document.querySelectorAll('details.update').forEach(d=>d.open=false);
 
-  // Init
-  document.addEventListener('DOMContentLoaded', ()=>{
-    renderTiles();
-    renderSummary();
+  // Refresh from correct source
+  async function refreshFromSource(){
+    if (supaReady){
+      try {
+        TEAM_UPDATES = await remoteLoadUpdates();
+        // Mirror to cache for offline
+        saveUpdatesLocal(TEAM_UPDATES);
+      } catch (e) {}
+    } else {
+      TEAM_UPDATES = loadUpdatesLocal();
+    }
     renderUpdates();
+
+    // Load meta (summary + counts)
+    if (supaReady){
+      try {
+        const meta = await remoteLoadMeta();
+        if (meta){
+          const sEl=$("#execSummary"), gEl=$("#ctGreen"), yEl=$("#ctYellow"), rEl=$("#ctRed");
+          if (sEl) sEl.textContent = meta.exec_summary || "";
+          if (gEl) gEl.textContent = String(meta.green ?? 0);
+          if (yEl) yEl.textContent = String(meta.yellow ?? 0);
+          if (rEl) rEl.textContent = String(meta.red ?? 0);
+          // mirror to local
+          try{
+            localStorage.setItem(SUM_KEY, meta.exec_summary || "");
+            localStorage.setItem(G_KEY, String(meta.green ?? 0));
+            localStorage.setItem(Y_KEY, String(meta.yellow ?? 0));
+            localStorage.setItem(R_KEY, String(meta.red ?? 0));
+          }catch{}
+        } else {
+          // No meta yet -> render from local
+          renderSummaryFromLocal();
+        }
+      } catch (e){ renderSummaryFromLocal(); }
+      updateTotal();
+    } else {
+      renderSummaryFromLocal();
+    }
+  }
+
+  // Realtime subscriptions (optional)
+  function setupRealtime(){
+    if (!supaReady) return;
+    const channel = supabase.channel("dashboard-updates");
+    channel
+      .on("postgres_changes", { event: "*", schema: "public", table: "updates" }, () => {
+        refreshFromSource();
+      })
+      .on("postgres_changes", { event: "*", schema: "public", table: "portfolio_meta" }, () => {
+        refreshFromSource();
+      })
+      .subscribe();
+  }
+
+  // Init
+  document.addEventListener('DOMContentLoaded', async ()=>{
+    renderTiles();
+    attachSummaryHandlers();
+    await refreshFromSource();
+    setupRealtime();
 
     $("#addUpdateBtn")?.addEventListener('click', (e)=>{ e.preventDefault(); addOrSaveUpdate(); });
     $("#expandAllBtn")?.addEventListener('click',(e)=>{ e.preventDefault(); expandAllUpdates(); });
