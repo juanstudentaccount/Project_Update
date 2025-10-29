@@ -196,8 +196,12 @@
   /*
     Shared persistence via Supabase (client-only). Steps:
     1) Create a Supabase project and copy your URL and anon key below.
-    2) Create tables:
+    2) Create tables and permissive RLS policies (see SQL below).
 
+    QUICK TEST (no code edit): you can also pass keys via URL:
+      ?supabaseUrl=https://xxxx.supabase.co&anon=eyJhbGciOi...
+
+    SQL you can run in Supabase (SQL editor), once:
        -- team updates
        create table if not exists public.updates (
          id text primary key,
@@ -210,6 +214,11 @@
          next jsonb default '[]'::jsonb,
          created_at timestamptz default now()
        );
+       alter table public.updates enable row level security;
+       create policy "updates anon read"   on public.updates for select using (true);
+       create policy "updates anon write"  on public.updates for insert with check (true);
+       create policy "updates anon update" on public.updates for update using (true);
+       create policy "updates anon delete" on public.updates for delete using (true);
 
        -- exec summary + counters (single row, id='default')
        create table if not exists public.portfolio_meta (
@@ -222,35 +231,38 @@
        );
        insert into public.portfolio_meta (id) values ('default')
        on conflict (id) do nothing;
-
-    3) Turn on Row Level Security. Add permissive policies for quick testing (tighten later):
-       -- updates
-       create policy "updates anon read" on public.updates for select using (true);
-       create policy "updates anon write" on public.updates for insert with check (true);
-       create policy "updates anon update" on public.updates for update using (true);
-       create policy "updates anon delete" on public.updates for delete using (true);
-
-       -- portfolio_meta
-       create policy "meta anon read" on public.portfolio_meta for select using (true);
-       create policy "meta anon write" on public.portfolio_meta for insert with check (true);
+       alter table public.portfolio_meta enable row level security;
+       create policy "meta anon read"   on public.portfolio_meta for select using (true);
+       create policy "meta anon write"  on public.portfolio_meta for insert with check (true);
        create policy "meta anon update" on public.portfolio_meta for update using (true);
-
-    4) Deploy this HTML on GitHub Pages. Everyone will read/write the shared tables.
   */
 
   import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-  // === CONFIGURE THESE TWO VALUES ===
-  const SUPABASE_URL = "https://YOUR_PROJECT.supabase.co";
-  const SUPABASE_ANON_KEY = "YOUR_ANON_KEY";
-  // ==================================
+  // === CONFIGURE THESE TWO VALUES (or pass via query string) ===
+  const SUPABASE_URL_DEFAULT = "https://YOUR_PROJECT.supabase.co"; // <-- paste your URL
+  const SUPABASE_ANON_KEY_DEFAULT = "YOUR_ANON_KEY";               // <-- paste your anon key
+  // =============================================================
 
-  const supaReady = SUPABASE_URL.startsWith("https://") && !SUPABASE_URL.includes("YOUR_PROJECT") && !SUPABASE_ANON_KEY.includes("YOUR_ANON_KEY");
+  // Allow testing via URL params: ?supabaseUrl=...&anon=...
+  const qs = new URLSearchParams(location.search);
+  const SUPABASE_URL = (qs.get("supabaseUrl") || SUPABASE_URL_DEFAULT).trim();
+  const SUPABASE_ANON_KEY = (qs.get("anon") || SUPABASE_ANON_KEY_DEFAULT).trim();
+
+  const supaReady =
+    SUPABASE_URL.startsWith("https://") &&
+    !SUPABASE_URL.includes("YOUR_PROJECT") &&
+    SUPABASE_ANON_KEY &&
+    !SUPABASE_ANON_KEY.includes("YOUR_ANON_KEY");
+
   const supabase = supaReady ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
 
   // Show connection status
   const conn = document.getElementById("connStatus");
   if (conn) conn.textContent = supaReady ? "Connected (shared via Supabase)" : "Local-only (no backend)";
+  if (!supaReady) {
+    console.info("[PMO] Supabase keys not set; running in local-only mode. Add your keys in the file (or via ?supabaseUrl=&anon=).");
+  }
 
   // Optional tiles data (defensive rendering)
   const PMO_LINKS = [
